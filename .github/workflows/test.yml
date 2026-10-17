@@ -22,4 +22,4 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -W error::ResourceWarning -m unittest -q
       - run: python -m py_compile claude_pool.py setup_pool.py
-      - run: sh -n install.sh bin/claude-pool
+      - run: sh -n install.sh bin/claude-pool share-mcp.sh
