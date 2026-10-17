@@ -21,6 +21,8 @@ Claude process; it never copies credentials or merges account directories.
 - The same Claude session ID and complete conversation history.
 - A manual fallback: send `continue` in the same T3 chat.
 - Separate credentials for every account.
+- Optional shared MCP sign-ins: sign in to Linear, Notion and similar servers
+  once, and every pooled account uses them.
 - Standard-library Python with no package installation.
 - An idempotent installer that backs up T3 settings before changing them.
 
@@ -152,6 +154,46 @@ If an account fails before a safe automatic handoff is possible, send
 `continue` in the same T3 chat. The next wrapper process excludes accounts it
 has already observed as full and resumes the session on another account.
 
+### 6. Share MCP sign-ins across accounts (optional)
+
+Each Claude account normally signs in to every MCP server on its own. To sign in
+once and use that sign-in from every pooled account, list the servers in one file:
+
+```sh
+mkdir -p ~/.config/claude-pool
+cp mcp-servers.example.txt ~/.config/claude-pool/mcp-servers.txt
+```
+
+Edit it to keep only the services you use, then sign in once per server:
+
+```sh
+./share-mcp.sh login            # every server, one after another
+./share-mcp.sh login linear     # or one server
+```
+
+Open each printed link and approve. The tokens are stored once in `~/.mcp-auth`.
+On a remote machine, forward the server's callback port from the computer whose
+browser you use, before opening the link:
+
+```sh
+ssh -N -L 3334:127.0.0.1:3334 <your-devbox>
+```
+
+Then add every server to every account in the pool config:
+
+```sh
+./share-mcp.sh apply
+```
+
+Start a new chat to pick the servers up. Adding an account later only needs
+`./share-mcp.sh apply` again, with no new sign-ins.
+
+This works only for servers that let any app register itself (dynamic client
+registration): Linear, Notion, Sentry, Supabase and LaunchDarkly do. Slack,
+Gmail, Google Drive and Google Calendar do not; connect those per account in
+claude.ai. If `claude mcp list` reports a server "defined in multiple scopes",
+remove the older entry with `claude mcp remove <name> -s local` in that project.
+
 ## Configuration
 
 The default account file is:
@@ -282,6 +324,10 @@ Installed Claude Pool files are limited to:
 ~/.local/state/claude-pool/
 ```
 
+If you used `share-mcp.sh`, its servers file is in `~/.config/claude-pool/` and
+its sign-in tokens are in `~/.mcp-auth`. Remove a shared server from an account
+with `CLAUDE_CONFIG_DIR=<dir> claude mcp remove --scope user <name>`.
+
 Do not delete an account's `.claude*` directory during rollback; it contains that
 account's own login and session history.
 
@@ -290,7 +336,7 @@ account's own login and session history.
 ```sh
 python3 -W error::ResourceWarning -m unittest -q
 python3 -m py_compile claude_pool.py setup_pool.py
-sh -n install.sh bin/claude-pool
+sh -n install.sh bin/claude-pool share-mcp.sh
 ```
 
 The fake-child integration suite covers automatic switching, exhaustion,

@@ -1,0 +1,8 @@
+# One line per MCP server: <name> <url> <callback-port>
+# Copy to ~/.config/claude-pool/mcp-servers.txt and keep only the services you use.
+# Each callback port must be free and must stay the same after the first sign-in.
+linear       https://mcp.linear.app/mcp                     3334
+notion       https://mcp.notion.com/mcp                     3335
+sentry       https://mcp.sentry.dev/mcp                     3336
+supabase     https://mcp.supabase.com/mcp                   3337
+launchdarkly https://mcp.launchdarkly.com/mcp/launchdarkly  3345
