@@ -18,7 +18,7 @@ import fcntl
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -734,6 +734,27 @@ def _initialize_request(raw: bytes) -> Optional[str]:
     return request_id if isinstance(request_id, str) else None
 
 
+# Session setup the SDK sends after initialize (T3 attaches its own tools with
+# mcp_set_servers). A new child must get it again; only the latest of each
+# counts, except flag settings, which merge.
+_REPLAYED_CONTROLS = ("mcp_set_servers", "set_model", "set_permission_mode")
+_MERGED_CONTROLS = ("apply_flag_settings",)
+
+
+def _session_control(raw: bytes) -> Optional[Tuple[str, str]]:
+    event = _json_line(raw)
+    if not event or event.get("type") != "control_request":
+        return None
+    request = event.get("request")
+    request_id = event.get("request_id")
+    if not isinstance(request, dict) or not isinstance(request_id, str):
+        return None
+    subtype = request.get("subtype")
+    if subtype in _REPLAYED_CONTROLS or subtype in _MERGED_CONTROLS:
+        return subtype, request_id
+    return None
+
+
 def _matches_control_response(event: Mapping[str, Any], request_id: str) -> bool:
     if event.get("type") != "control_response":
         return False
@@ -758,6 +779,7 @@ class _InputRouter:
         self.writer_active = False
         self.initialize_line: Optional[bytes] = None
         self.initialize_request_id: Optional[str] = None
+        self.session_controls: List[Tuple[str, str, bytes]] = []
         self.reader_thread = threading.Thread(
             target=self._read, name="claude-pool-stdin-reader", daemon=True
         )
@@ -790,6 +812,7 @@ class _InputRouter:
                     self.condition.notify_all()
                 return
             request_id = _initialize_request(raw)
+            control = _session_control(raw)
             with self.condition:
                 while (
                     not self.stopped
@@ -802,6 +825,13 @@ class _InputRouter:
                 if request_id is not None and self.initialize_line is None:
                     self.initialize_line = raw
                     self.initialize_request_id = request_id
+                if control is not None:
+                    subtype, control_id = control
+                    if subtype not in _MERGED_CONTROLS:
+                        self.session_controls = [
+                            entry for entry in self.session_controls if entry[0] != subtype
+                        ]
+                    self.session_controls.append((subtype, control_id, raw))
                 self.pending.append(raw)
                 self.pending_bytes += len(raw)
                 self.max_observed_pending_bytes = max(
@@ -866,18 +896,25 @@ class _InputRouter:
 
     def complete_switch(
         self, target: BinaryIO, recovery_line: Optional[bytes]
-    ) -> Optional[str]:
+    ) -> Set[str]:
         with self.condition:
             self.target = target
+            replayed: Set[str] = set()
             if self.initialize_line is not None:
+                for _subtype, control_id, line in reversed(self.session_controls):
+                    self.pending.appendleft(line)
+                    self.pending_bytes += len(line)
+                    replayed.add(control_id)
                 self.pending.appendleft(self.initialize_line)
                 self.pending_bytes += len(self.initialize_line)
+                if self.initialize_request_id is not None:
+                    replayed.add(self.initialize_request_id)
             if recovery_line is not None:
                 self.pending.append(recovery_line)
                 self.pending_bytes += len(recovery_line)
             self.paused = False
             self.condition.notify_all()
-            return self.initialize_request_id
+            return replayed
 
     def abort_switch(self, target: BinaryIO) -> None:
         with self.condition:
@@ -1078,7 +1115,7 @@ class PoolProcess:
         assert child.stdin is not None and child.stdout is not None
         router = _InputRouter(stdin, child.stdin, self.config.input_buffer_bytes)
         router.start()
-        suppress_response_id: Optional[str] = None
+        suppress_response_ids: Set[str] = set()
         confirmed_init = False
         pending_limit_raw: Optional[bytes] = None
         pending_previous_account: Optional[AccountStatus] = None
@@ -1109,8 +1146,16 @@ class PoolProcess:
                     if pending_limit_raw is None:
                         self.state.set_session_account(session_id, account.slug)
 
-                if suppress_response_id and _matches_control_response(event, suppress_response_id):
-                    suppress_response_id = None
+                suppressed = next(
+                    (
+                        request_id
+                        for request_id in suppress_response_ids
+                        if _matches_control_response(event, request_id)
+                    ),
+                    None,
+                )
+                if suppressed is not None:
+                    suppress_response_ids.discard(suppressed)
                     continue
 
                 limit = parse_limit_event(event)
@@ -1179,7 +1224,7 @@ class PoolProcess:
                                     fallback_child.stdin is not None
                                     and fallback_child.stdout is not None
                                 )
-                                suppress_response_id = router.complete_switch(
+                                suppress_response_ids = router.complete_switch(
                                     fallback_child.stdin, None
                                 )
                                 child = fallback_child
@@ -1198,7 +1243,7 @@ class PoolProcess:
                                 return child.returncode if child.returncode is not None else 1
 
                         try:
-                            suppress_response_id = router.complete_switch(
+                            suppress_response_ids = router.complete_switch(
                                 new_child.stdin, self._recovery_line(effective_session)
                             )
                             pending_limit_raw = raw
