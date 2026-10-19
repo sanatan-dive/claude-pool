@@ -100,6 +100,7 @@ def main():
         return 0
 
     limited = False
+    controls = []
     for raw in sys.stdin.buffer:
         if behavior.get("mode") == "passthrough":
             emit(raw)
@@ -111,6 +112,7 @@ def main():
             continue
 
         if event.get("type") == "control_request":
+            controls.append(event.get("request", {}).get("subtype"))
             emit(
                 {
                     "type": "control_response",
@@ -153,6 +155,7 @@ def main():
                     "continued": True,
                     "history_seen": history_seen,
                     "final_history_seen": final_history_seen,
+                    "controls": controls,
                     "session_id": session_id,
                 }
             )

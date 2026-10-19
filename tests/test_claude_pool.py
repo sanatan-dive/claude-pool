@@ -1003,6 +1003,34 @@ class SupervisorFixtureTests(unittest.TestCase):
             len([event for event in events if event.get("type") == "control_response"]), 1
         )
 
+    def test_switch_replays_session_setup_so_t3_tools_survive(self):
+        self.write_behavior({"mode": "limit"}, {"mode": "continue"})
+        stdin = BytesIO(
+            b'{"type":"control_request","request_id":"init-1","request":{"subtype":"initialize"}}\n'
+            b'{"type":"control_request","request_id":"mcp-1","request":{"subtype":"mcp_set_servers","servers":{"t3-code":{"type":"http"}}}}\n'
+            b'{"type":"control_request","request_id":"model-1","request":{"subtype":"set_model","model":"old"}}\n'
+            b'{"type":"control_request","request_id":"flags-1","request":{"subtype":"apply_flag_settings","settings":{"a":1}}}\n'
+            b'{"type":"control_request","request_id":"model-2","request":{"subtype":"set_model","model":"new"}}\n'
+            b'{"type":"control_request","request_id":"flags-2","request":{"subtype":"apply_flag_settings","settings":{"b":2}}}\n'
+            b'{"type":"user","message":{"role":"user","content":"do work"}}\n'
+        )
+        stdout = BytesIO()
+
+        code = PoolProcess(self.config()).run([], self.env(), stdin=stdin, stdout=stdout)
+
+        events = self.events(stdout)
+        self.assertEqual(code, 0)
+        continued = [event for event in events if event.get("continued")]
+        self.assertEqual(len(continued), 1)
+        self.assertEqual(continued[0]["account"], "account-b")
+        self.assertEqual(
+            continued[0]["controls"],
+            ["initialize", "mcp_set_servers", "apply_flag_settings", "set_model", "apply_flag_settings"],
+        )
+        responses = [event["request_id"] for event in events if event.get("type") == "control_response"]
+        self.assertEqual(sorted(responses), sorted(["init-1", "mcp-1", "model-1", "flags-1", "model-2", "flags-2"]))
+        self.assertTrue(all(event["account"] == "account-a" for event in events if event.get("type") == "control_response"))
+
     def test_source_is_stopped_before_final_history_copy_and_target_start(self):
         target_started = self.root / "target-started"
         self.write_behavior(
