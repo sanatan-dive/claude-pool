@@ -16,7 +16,7 @@ import time
 import hashlib
 import fcntl
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -525,6 +525,25 @@ def _configured_account_inventory(settings_path: Optional[Path]) -> List[Account
     return accounts
 
 
+def login_emptied(config_dir: Path) -> bool:
+    """True when the account's login file exists but holds no tokens, as Claude Code leaves it once
+    the login is gone. A missing or unreadable file proves nothing: macOS keeps logins in the Keychain."""
+    try:
+        login = json.loads((config_dir / ".credentials.json").read_text()).get("claudeAiOauth")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(login, dict) and not login.get("accessToken") and not login.get("refreshToken")
+
+
+def _without_emptied_logins(accounts: List[AccountStatus]) -> List[AccountStatus]:
+    return [
+        replace(account, signed_in=False)
+        if account.signed_in and login_emptied(account.config_dir)
+        else account
+        for account in accounts
+    ]
+
+
 def load_cached_account_statuses(
     cache_path: Path,
     fallback_dir: Path,
@@ -539,7 +558,7 @@ def load_cached_account_statuses(
         try:
             cached = json.loads(Path(cache_path).read_text())
         except (FileNotFoundError, OSError, ValueError):
-            return explicit
+            return _without_emptied_logins(explicit)
         attempted_at = _number(cached.get("attempted_at")) if isinstance(cached, dict) else None
         fresh = (
             attempted_at is not None
@@ -548,7 +567,7 @@ def load_cached_account_statuses(
             and cached.get("refreshing") is not True
         )
         if not fresh:
-            return explicit
+            return _without_emptied_logins(explicit)
         cached_accounts = _accounts_from_payload(cached.get("payload"))
         cached_by_dir: Dict[Path, List[AccountStatus]] = {}
         for cached_account in cached_accounts:
@@ -572,7 +591,7 @@ def load_cached_account_statuses(
                     usage.switch_eligible,
                 )
             )
-        return merged
+        return _without_emptied_logins(merged)
 
     fallback = AccountStatus(
         "main", Path(os.path.expanduser(str(fallback_dir))), True, switch_eligible=False
@@ -967,10 +986,10 @@ class PoolProcess:
 
     def _select_initial(self, session_id: Optional[str]) -> Optional[AccountStatus]:
         previous_slug = self.state.session_account(session_id) if session_id else None
+        ranked = self._ranked()  # reloads every account's status, so a login lost since start counts
         previous = self._account(previous_slug)
         if previous and previous.signed_in and not self.state.is_full(previous.slug, self.config.now()):
             return previous
-        ranked = self._ranked()
         if ranked:
             return ranked[0]
         if previous:

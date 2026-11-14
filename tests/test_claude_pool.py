@@ -421,6 +421,39 @@ class PortableInventoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate account config_dir"):
                 load_pool_config(config)
 
+    def test_configured_account_with_emptied_login_is_signed_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            logins = {
+                "emptied": {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}},
+                "valid": {"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "expiresAt": 1}},
+                "garbled": None,
+                "missing": None,
+            }
+            for slug, login in logins.items():
+                (root / slug).mkdir()
+                if login is not None:
+                    (root / slug / ".credentials.json").write_text(json.dumps(login))
+            (root / "garbled" / ".credentials.json").write_text("{not json")
+            config = root / "config.json"
+            config.write_text(
+                json.dumps({"accounts": [{"slug": s, "config_dir": str(root / s)} for s in logins]})
+            )
+
+            accounts = load_cached_account_statuses(
+                root / "usage.json",
+                root / "valid",
+                configured_accounts=load_pool_config(config),
+                now=lambda: 1_000,
+            )
+
+            signed_in = {account.slug: account.signed_in for account in accounts}
+            # Only a login file that exists and holds no tokens proves a sign-out; a missing or
+            # unreadable one proves nothing (macOS keeps logins in the Keychain).
+            self.assertEqual(
+                signed_in, {"emptied": False, "valid": True, "garbled": True, "missing": True}
+            )
+
     def test_explicit_inventory_replaces_stale_usage_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1002,6 +1035,32 @@ class SupervisorFixtureTests(unittest.TestCase):
         self.assertEqual(
             len([event for event in events if event.get("type") == "control_response"]), 1
         )
+
+    def test_session_moves_off_an_account_whose_login_was_emptied(self):
+        (self.account_a / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}})
+        )
+        self.write_behavior({"mode": "continue"}, {"mode": "continue"})
+        StateStore(self.state_path).set_session_account("fixture-session", "a")
+        history = self.account_a / "projects" / cwd_slug(self.root) / "fixture-session.jsonl"
+        history.parent.mkdir(parents=True)
+        history.write_text("remembered-before-limit\n")
+        config = self.config()
+        config.configured_accounts = [
+            AccountStatus("a", self.account_a, True),
+            AccountStatus("b", self.account_b, True),
+        ]
+        config.account_cache_path = self.root / "usage.json"
+        config.fallback_config_dir = self.account_a
+        stdin = BytesIO(b'{"type":"user","message":{"role":"user","content":"do work"}}\n')
+        stdout = BytesIO()
+
+        PoolProcess(config).run(["--resume", "fixture-session"], self.env(), stdin=stdin, stdout=stdout)
+
+        events = self.events(stdout)
+        inits = [event for event in events if event.get("subtype") == "init"]
+        self.assertEqual(inits[0]["account"], "account-b")
+        self.assertTrue(next(e for e in events if e.get("type") == "echo")["history_seen"])
 
     def test_switch_replays_session_setup_so_t3_tools_survive(self):
         self.write_behavior({"mode": "limit"}, {"mode": "continue"})
